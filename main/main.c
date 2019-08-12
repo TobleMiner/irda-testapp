@@ -11,6 +11,11 @@
 #include <driver/uart.h>
 
 #include "irda/irhal/irhal.h"
+#include "irda/irphy/irphy.h"
+
+
+#define IRDA_TX_GPIO 23
+#define IRDA_RX_GPIO 22
 
 esp_err_t event_handler(void *ctx, system_event_t *event) {
     return ESP_OK;
@@ -29,17 +34,22 @@ static uint64_t app_get_time(void* priv) {
 struct {
   esp_timer_handle_t timer;
   struct irhal hal;
-  irhal_alarm_cb cb;
+  irhal_alarm_cb alarm_cb;
+  QueueHandle_t uart_queue;
+  struct irphy phy;
+  irphy_rx_cb rx_cb;
+  TaskHandle_t cd_task;
+  irphy_carrier_cb cd_cb;
 } irda;
 
 static void app_irda_timer_cb(void* arg) {
   ESP_LOGI(TAG, "Calling alarm cb");
-  irda.cb(&irda.hal);
+  irda.alarm_cb(&irda.hal);
 }
 
 static int app_start_irda_timer(struct irhal* hal, irhal_alarm_cb cb, uint64_t timeout, void* arg) {
   ESP_LOGI(TAG, "Scheduling timer in %llu µs", timeout);
-  irda.cb = cb;
+  irda.alarm_cb = cb;
   return -esp_timer_start_once(irda.timer, timeout);
 }
 
@@ -90,6 +100,124 @@ static void irda_log(void* priv, int level, const char* tag, const char* fmt, ..
   }
 }
 
+static int irda_set_baudrate(uint32_t rate, void* priv) {
+  return -uart_set_baudrate(IRDA_UART, rate);
+}
+
+static int irda_tx_enable(void* priv) {
+  return 0;
+}
+
+static int irda_tx_disable(void* priv) {
+  return 0;
+}
+
+static ssize_t irda_tx(const void* data, size_t len, void* priv) {
+  return uart_write_bytes(IRDA_UART, (char*)data, len);
+}
+
+static int irda_rx_enable(const struct irphy* phy, irphy_rx_cb cb, void* priv) {
+  irda.rx_cb = cb;
+  return 0;
+}
+
+static int irda_rx_disable(void* priv) {
+  irda.rx_cb = NULL;
+  return 0;
+}
+
+static ssize_t irda_rx(void* data, size_t len, void* priv) {
+  size_t buffered_len;
+  uart_get_buffered_data_len(IRDA_UART, &buffered_len);
+  if(buffered_len < len) {
+    len = buffered_len;
+  }
+  return uart_read_bytes(IRDA_UART, (unsigned char*)data, len, 0);
+}
+
+static void uart_event_task(void* arg) {
+  while(1) {
+    uart_event_t event;
+    if(xQueueReceive(&irda.uart_queue, (void*)&event, portMAX_DELAY)) {
+      switch(event.type) {
+        case UART_DATA:
+          if(irda.rx_cb) {
+            size_t buffered_len;
+            uart_get_buffered_data_len(IRDA_UART, &buffered_len);
+            irda.rx_cb(&irda.phy, buffered_len);
+          }
+          break;
+        case UART_FIFO_OVF:
+          ESP_LOGW(TAG, "hw fifo overflow");
+          uart_flush_input(IRDA_UART);
+          xQueueReset(&irda.uart_queue);
+          break;
+        case UART_BUFFER_FULL:
+          ESP_LOGW(TAG, "ring buffer full");
+          uart_flush_input(IRDA_UART);
+          xQueueReset(&irda.uart_queue);
+          break;
+        default:
+          ESP_LOGW(TAG, "Unhandled uart event %d", event.type);
+          break;
+      }
+    }
+  }
+}
+
+static void uart_enable() {
+  ESP_ERROR_CHECK(uart_set_pin(IRDA_UART, IRDA_TX_GPIO, IRDA_RX_GPIO, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+  ESP_ERROR_CHECK(uart_driver_install(IRDA_UART, 256, 1024, 0, NULL, 0));
+  ESP_ERROR_CHECK(uart_set_mode(IRDA_UART, UART_MODE_IRDA));
+
+  UART2.conf0.irda_tx_en = 1;
+}
+
+static void cd_task(void* arg) {
+  while(1) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    if(irda.cd_cb) {
+      irda.cd_cb(&irda.phy);
+    }
+  }
+}
+
+static void IRAM_ATTR cd_isr(void* priv) {
+  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+  vTaskNotifyGiveFromISR(&irda.cd_task, &xHigherPriorityTaskWoken);
+  if(xHigherPriorityTaskWoken == pdTRUE) {
+    portYIELD_FROM_ISR();
+  }
+}
+
+static int irda_cd_enable(const struct irphy* phy, irphy_carrier_cb cb, void* priv) {
+  esp_err_t err;
+  gpio_config_t gpio_conf = {
+    .intr_type = GPIO_PIN_INTR_NEGEDGE,
+    .pin_bit_mask = 1ULL << IRDA_RX_GPIO,
+    .mode = GPIO_MODE_INPUT,
+  };
+  uart_driver_delete(IRDA_UART);
+  gpio_install_isr_service(0);
+  irda.cd_cb = cb;
+  err = gpio_config(&gpio_conf);
+  if(err) {
+    return -err;
+  }
+  return -gpio_isr_handler_add(IRDA_RX_GPIO, cd_isr, NULL);
+}
+
+static int irda_cd_disable(void* priv) {
+  gpio_isr_handler_remove(IRDA_RX_GPIO);
+  uart_enable();
+  return 0;
+}
+
+static void irda_carrier_cb(bool detected, void* arg) {
+  ESP_LOGI(TAG, "carrier detect cb");
+  ESP_LOGI(TAG, "Carrier detection finished, %s", detected ? "carrier detected" : "no carrier detected");
+}
+
 int app_main() {
   esp_timer_create_args_t timer_args = {
     .callback = app_irda_timer_cb,
@@ -109,8 +237,8 @@ int app_main() {
 
   ESP_ERROR_CHECK(irhal_init(&irda.hal, &hal_ops, 1000000000ULL, 1000));
 
-  int timerid = irhal_set_timer(&irda.hal, &timeout, timer_cb, NULL);
-  ESP_LOGI("IRDA TIMER", "Timer id: %d", timerid);
+//  int timerid = irhal_set_timer(&irda.hal, &timeout, timer_cb, NULL);
+//  ESP_LOGI("IRDA TIMER", "Timer id: %d", timerid);
 
   uart_config_t uart_config = {
     .baud_rate = 115200,
@@ -121,13 +249,29 @@ int app_main() {
   };
 
   ESP_ERROR_CHECK(uart_param_config(IRDA_UART, &uart_config));
-  ESP_ERROR_CHECK(uart_set_pin(IRDA_UART, 23, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-  ESP_ERROR_CHECK(uart_driver_install(IRDA_UART, 256, 1024, 0, NULL, 0));
-  ESP_ERROR_CHECK(uart_set_mode(IRDA_UART, UART_MODE_IRDA));
+  uart_enable();
 
-  UART2.conf0.irda_tx_en = 1;
+//  xTaskCreate(uart_event_task, "uart_event_task", 4096, NULL, 12, NULL);
+  xTaskCreate(cd_task, "carrier_detect_task", 4096, NULL, 12, &irda.cd_task);
+
+  struct irphy_hal_ops phy_hal_ops = {
+    .set_baudrate = irda_set_baudrate,
+    .tx_enable = irda_tx_enable,
+    .tx = irda_tx,
+    .tx_disable = irda_tx_disable,
+    .rx_enable = irda_rx_enable,
+    .rx = irda_rx,
+    .rx_disable = irda_rx_disable,
+    .cd_enable = irda_cd_enable,
+    .cd_disable = irda_cd_disable,
+  };
+
+  ESP_ERROR_CHECK(irphy_init(&irda.phy, &irda.hal, &phy_hal_ops));
 
   while(1) {
-    vTaskDelay(500 / portTICK_PERIOD_MS);
+    time_ns_t cd_duration = { .sec = 1, .nsec = 0 };
+    ESP_LOGI(TAG, "Starting carrier detection");
+    ESP_ERROR_CHECK(irphy_run_cd(&irda.phy, &cd_duration, irda_carrier_cb, NULL));
+    vTaskDelay(3000 / portTICK_PERIOD_MS);
   }
 }
