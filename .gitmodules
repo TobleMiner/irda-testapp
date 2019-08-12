@@ -1,0 +1,3 @@
+[submodule "main/irda"]
+	path = main/irda
+	url = git@github.com:TobleMiner/libirda.git
