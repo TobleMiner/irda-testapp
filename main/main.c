@@ -52,6 +52,7 @@ struct {
   bool cd_enabled;
   bool uart_enabled;
   TaskHandle_t main_task;
+  uint32_t baudrate;
 } irda;
 
 static void app_irda_timer_cb(void* arg) {
@@ -72,20 +73,30 @@ static int app_clear_irda_timer(void* arg) {
 time_ns_t timeout = { .sec = 0, .nsec = 500000000UL };
 
 
-static void timer_cb(void* ctx);
+static ssize_t irda_tx(const void* data, size_t len, void* priv);
 
 static void timer_cb(void* ctx) {
   ESP_LOGI("IRDA TIMER", "Timer fired");
-  uart_write_bytes(IRDA_UART, str, strlen(str));
-  int timerid = irhal_set_timer(&irda.hal, &timeout, timer_cb, NULL);
-  ESP_LOGI("IRDA TIMER", "Timer id: %d", timerid);
+  irda_tx(str, strlen(str), NULL);
 }
 
 static void uart_event_task(void* arg);
 
 static int enable_uart() {
   int err;
+  uart_config_t uart_config = {
+    .baud_rate = irda.baudrate,
+    .data_bits = UART_DATA_8_BITS,
+    .parity = UART_PARITY_DISABLE,
+    .stop_bits = UART_STOP_BITS_1,
+    .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+  };
+
   ESP_LOGI(TAG, "Enabling uart");
+  err = -uart_param_config(IRDA_UART, &uart_config);
+  if(err) {
+    goto fail;
+  }
   err = -uart_set_pin(IRDA_UART, IRDA_TX_GPIO, IRDA_RX_GPIO, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
   if(err) {
     goto fail;
@@ -185,7 +196,12 @@ static void irda_log(void* priv, int level, const char* tag, const char* fmt, ..
 }
 
 static int irda_set_baudrate(uint32_t rate, void* priv) {
-  return -uart_set_baudrate(IRDA_UART, rate);
+  int err;
+  err = uart_set_baudrate(IRDA_UART, rate);
+  if(!err) {
+    irda.baudrate = rate;
+  }
+  return -err;
 }
 
 static int irda_tx_enable(void* priv) {
@@ -374,6 +390,9 @@ int irda_tx_wait(void* arg) {
 int app_main() {
   memset(&irda, 0, sizeof(irda));
   irda.main_task = xTaskGetCurrentTaskHandle();
+  irda.baudrate = 9600;
+
+  irda_set_baudrate(115200, NULL);
 
   esp_timer_create_args_t timer_args = {
     .callback = app_irda_timer_cb,
@@ -395,18 +414,6 @@ int app_main() {
 
   ESP_ERROR_CHECK(irhal_init(&irda.hal, &hal_ops, 1000000000ULL, 1000));
 
-//  int timerid = irhal_set_timer(&irda.hal, &timeout, timer_cb, NULL);
-//  ESP_LOGI("IRDA TIMER", "Timer id: %d", timerid);
-
-  uart_config_t uart_config = {
-    .baud_rate = 115200,
-    .data_bits = UART_DATA_8_BITS,
-    .parity = UART_PARITY_DISABLE,
-    .stop_bits = UART_STOP_BITS_1,
-    .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-  };
-
-  ESP_ERROR_CHECK(uart_param_config(IRDA_UART, &uart_config));
   irda_tx_enable(NULL);
 
   xTaskCreate(cd_task, "carrier_detect_task", 4096, NULL, 12, &irda.cd_task);
@@ -428,8 +435,13 @@ int app_main() {
 
   while(1) {
     time_ns_t cd_duration = { .sec = 1, .nsec = 0 };
+    irda_tx_enable(NULL);
+    int timerid = irhal_set_timer(&irda.hal, &timeout, timer_cb, NULL);
+    ESP_LOGI("IRDA TIMER", "Timer id: %d", timerid);
+    vTaskDelay(3000 / portTICK_PERIOD_MS);
     ESP_LOGI(TAG, "Starting carrier detection");
-    ESP_ERROR_CHECK(irphy_run_cd(&irda.phy, &cd_duration, irda_carrier_cb, NULL));
+//    ESP_ERROR_CHECK(irphy_run_cd(&irda.phy, &cd_duration, irda_carrier_cb, NULL));
+    irda_tx_disable(NULL);
     vTaskDelay(3000 / portTICK_PERIOD_MS);
   }
 }
