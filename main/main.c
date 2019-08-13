@@ -45,6 +45,7 @@ struct {
   bool tx_enabled;
   bool cd_enabled;
   bool uart_enabled;
+  TaskHandle_t main_task;
 } irda;
 
 static void app_irda_timer_cb(void* arg) {
@@ -78,11 +79,12 @@ static void uart_event_task(void* arg);
 
 static int enable_uart() {
   int err;
+  ESP_LOGI(TAG, "Enabling uart");
   err = -uart_set_pin(IRDA_UART, IRDA_TX_GPIO, IRDA_RX_GPIO, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
   if(err) {
     goto fail;
   }
-  err = -uart_driver_install(IRDA_UART, 256, 1024, 0, NULL, 0);
+  err = -uart_driver_install(IRDA_UART, 256, 1024, 32, &irda.uart_queue, 0);
   if(err) {
     goto fail;
   }
@@ -107,19 +109,24 @@ fail:
 }
 
 static int disable_uart() {
-  if(&irda.uart_event_task != NULL) {
-    vTaskDelete(&irda.uart_event_task);
-  } else {
-    ESP_LOGW(TAG,"UART task is NULL, skipping task deletion. BUG?");
-  }
+  uart_event_t event = {
+    .type = UART_EVENT_MAX,
+  };
+  ESP_LOGI(TAG, "Disabling uart");
+  ESP_LOGI(TAG, "Sending termination request to uart event task");
+  xQueueSend(irda.uart_queue, &event, portMAX_DELAY);
+  ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+  ESP_LOGI(TAG, "Got termination notification from uart event task");
   uart_driver_delete(IRDA_UART);
   return 0;
 }
 
 static int update_uart_state() {
   int err;
+  ESP_LOGI(TAG, "Updating uart state");
   if((irda.rx_enabled || irda.tx_enabled) && !irda.cd_enabled) {
     if(irda.uart_enabled) {
+      ESP_LOGI(TAG, "UART already enabled");
       return 0;
     }
     err = enable_uart();
@@ -129,6 +136,7 @@ static int update_uart_state() {
     return err;
   } else {
     if(!irda.uart_enabled) {
+      ESP_LOGI(TAG, "UART already disabled");
       return 0;
     }
     err = disable_uart();
@@ -224,7 +232,8 @@ static ssize_t irda_rx(void* data, size_t len, void* priv) {
 static void uart_event_task(void* arg) {
   while(1) {
     uart_event_t event;
-    if(xQueueReceive(&irda.uart_queue, (void*)&event, 1/pdMS_TO_TICKS());
+    if(xQueueReceive(irda.uart_queue, (void*)&event, portMAX_DELAY)) {
+      ESP_LOGI(TAG, "Got uart event");
       switch(event.type) {
         case UART_DATA:
           if(irda.rx_cb) {
@@ -243,21 +252,24 @@ static void uart_event_task(void* arg) {
           uart_flush_input(IRDA_UART);
           xQueueReset(&irda.uart_queue);
           break;
+        case UART_EVENT_MAX:
+          ESP_LOGI(TAG, "Terminating uart event task, MAX event received");
+          xTaskNotifyGive(irda.main_task);
+          break;
         default:
           ESP_LOGW(TAG, "Unhandled uart event %d", event.type);
           break;
       }
-    } else {
-      ESP_LOGI(TAG, "Failed to get event from uart queue, killed? Bailing out");
-      break;
     }
   }
+  
   vTaskDelete(NULL);
 }
 
 static void cd_task(void* arg) {
   while(1) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    ESP_LOGI(TAG, "Got carrier detect notification");
     if(irda.cd_cb) {
       irda.cd_cb(&irda.phy);
     }
@@ -266,7 +278,7 @@ static void cd_task(void* arg) {
 
 static void IRAM_ATTR cd_isr(void* priv) {
   BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-  vTaskNotifyGiveFromISR(&irda.cd_task, &xHigherPriorityTaskWoken);
+  vTaskNotifyGiveFromISR(irda.cd_task, &xHigherPriorityTaskWoken);
   if(xHigherPriorityTaskWoken == pdTRUE) {
     portYIELD_FROM_ISR();
   }
@@ -276,7 +288,7 @@ static int irda_cd_enable(const struct irphy* phy, irphy_carrier_cb cb, void* pr
   int err;
   gpio_config_t gpio_conf = {
     .intr_type = GPIO_PIN_INTR_NEGEDGE,
-    .pin_bit_mask = 1ULL << IRDA_RX_GPIO,
+    .pin_bit_mask = (1ULL << IRDA_RX_GPIO),
     .mode = GPIO_MODE_INPUT,
   };
   irda.cd_cb = cb;
@@ -291,6 +303,7 @@ static int irda_cd_enable(const struct irphy* phy, irphy_carrier_cb cb, void* pr
   if(err) {
     goto fail_update_state;
   }
+
   err = gpio_isr_handler_add(IRDA_RX_GPIO, cd_isr, NULL);
   if(err) {
     goto fail_update_state;
@@ -329,8 +342,7 @@ static void irda_carrier_cb(bool detected, void* arg) {
 
 int app_main() {
   memset(&irda, 0, sizeof(irda));
-
-  gpio_install_isr_service(0);
+  irda.main_task = xTaskGetCurrentTaskHandle();
 
   esp_timer_create_args_t timer_args = {
     .callback = app_irda_timer_cb,
@@ -338,6 +350,7 @@ int app_main() {
     .name = "IRDA timer"
   };
 
+  gpio_install_isr_service(0);
 
   ESP_ERROR_CHECK(esp_timer_create(&timer_args, &irda.timer));
 
