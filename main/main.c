@@ -8,6 +8,7 @@
 #include <esp_log.h>
 #include <esp_system.h>
 #include <esp_event.h>
+#include <driver/pcnt.h>
 #include <driver/uart.h>
 
 #include "irda/irhal/irhal.h"
@@ -17,13 +18,18 @@
 #define IRDA_TX_GPIO 23
 #define IRDA_RX_GPIO 22
 
+#define IRDA_UART    UART_NUM_2
+#define IRDA_PC      PCNT_UNIT_0
+#define IRDA_PC_CHAN PCNT_CHANNEL_0
+#define IRDA_PC_TRSH 32
+#define IRDA_PC_FLTR 20
+
 esp_err_t event_handler(void *ctx, system_event_t *event) {
     return ESP_OK;
 }
 
 #define TAG "IRDA"
 
-#define IRDA_UART UART_NUM_2
 
 const char* str = "This is an IRDA SIR message\n\r";
 
@@ -286,10 +292,14 @@ static void IRAM_ATTR cd_isr(void* priv) {
 
 static int irda_cd_enable(const struct irphy* phy, irphy_carrier_cb cb, void* priv) {
   int err;
-  gpio_config_t gpio_conf = {
-    .intr_type = GPIO_PIN_INTR_NEGEDGE,
-    .pin_bit_mask = (1ULL << IRDA_RX_GPIO),
-    .mode = GPIO_MODE_INPUT,
+  pcnt_config_t pc_conf = {
+    .pulse_gpio_num = IRDA_RX_GPIO,
+    .ctrl_gpio_num = PCNT_PIN_NOT_USED,
+    .pos_mode = PCNT_COUNT_DIS,
+    .neg_mode = PCNT_COUNT_INC,
+    .counter_h_lim = SHRT_MAX,
+    .unit = IRDA_PC,
+    .channel = IRDA_PC_CHAN,
   };
   irda.cd_cb = cb;
   irda.cd_enabled = true;
@@ -299,12 +309,17 @@ static int irda_cd_enable(const struct irphy* phy, irphy_carrier_cb cb, void* pr
     goto fail;
   }
 
-  err = gpio_config(&gpio_conf);
+  err = pcnt_unit_config(&pc_conf);
   if(err) {
     goto fail_update_state;
   }
+  pcnt_counter_clear(IRDA_PC);
+  pcnt_set_event_value(IRDA_PC, PCNT_EVT_THRES_0, IRDA_PC_TRSH);
+  pcnt_set_filter_value(IRDA_PC,IRDA_PC_FLTR);
+  pcnt_intr_enable(IRDA_PC);
+  pcnt_event_enable(IRDA_PC, PCNT_EVT_THRES_0);
 
-  err = gpio_isr_handler_add(IRDA_RX_GPIO, cd_isr, NULL);
+  err = pcnt_isr_handler_add(IRDA_PC, cd_isr, NULL);
   if(err) {
     goto fail_update_state;
   }
@@ -321,10 +336,22 @@ fail:
 
 static int irda_cd_disable(void* priv) {
   int err;
-  err = gpio_isr_handler_remove(IRDA_RX_GPIO);
+  pcnt_config_t pc_conf = {
+    .pulse_gpio_num = PCNT_PIN_NOT_USED,
+    .ctrl_gpio_num = PCNT_PIN_NOT_USED,
+    .pos_mode = PCNT_COUNT_DIS,
+    .neg_mode = PCNT_COUNT_INC,
+    .counter_h_lim = SHRT_MAX,
+    .unit = IRDA_PC,
+    .channel = IRDA_PC_CHAN,
+  };
+  err = pcnt_isr_handler_remove(IRDA_PC);
   if(err) {
     goto fail;
   }
+
+  // Deconfigure pulse counter
+  pcnt_unit_config(&pc_conf);
 
   irda.cd_enabled = false;
   err = update_uart_state();
@@ -350,7 +377,8 @@ int app_main() {
     .name = "IRDA timer"
   };
 
-  gpio_install_isr_service(0);
+  ESP_ERROR_CHECK(gpio_install_isr_service(0));
+  ESP_ERROR_CHECK(pcnt_isr_service_install(0));
 
   ESP_ERROR_CHECK(esp_timer_create(&timer_args, &irda.timer));
 
