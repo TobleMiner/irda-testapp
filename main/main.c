@@ -39,7 +39,12 @@ struct {
   struct irphy phy;
   irphy_rx_cb rx_cb;
   TaskHandle_t cd_task;
+  TaskHandle_t uart_event_task;
   irphy_carrier_cb cd_cb;
+  bool rx_enabled;
+  bool tx_enabled;
+  bool cd_enabled;
+  bool uart_enabled;
 } irda;
 
 static void app_irda_timer_cb(void* arg) {
@@ -67,6 +72,71 @@ static void timer_cb(void* ctx) {
   uart_write_bytes(IRDA_UART, str, strlen(str));
   int timerid = irhal_set_timer(&irda.hal, &timeout, timer_cb, NULL);
   ESP_LOGI("IRDA TIMER", "Timer id: %d", timerid);
+}
+
+static void uart_event_task(void* arg);
+
+static int enable_uart() {
+  int err;
+  err = -uart_set_pin(IRDA_UART, IRDA_TX_GPIO, IRDA_RX_GPIO, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+  if(err) {
+    goto fail;
+  }
+  err = -uart_driver_install(IRDA_UART, 256, 1024, 0, NULL, 0);
+  if(err) {
+    goto fail;
+  }
+  err = -uart_set_mode(IRDA_UART, UART_MODE_IRDA);
+  if(err) {
+    goto fail_driver;
+  }
+
+  UART2.conf0.irda_tx_en = 1;
+
+  if(xTaskCreate(uart_event_task, "uart_event_task", 4096, NULL, 12, &irda.uart_event_task) != pdPASS) {
+    err = -ENOMEM;
+    goto fail_driver;
+  }
+
+  return 0;
+
+fail_driver:
+  uart_driver_delete(IRDA_UART);
+fail:
+  return err;
+}
+
+static int disable_uart() {
+  if(&irda.uart_event_task != NULL) {
+    vTaskDelete(&irda.uart_event_task);
+  } else {
+    ESP_LOGW(TAG,"UART task is NULL, skipping task deletion. BUG?");
+  }
+  uart_driver_delete(IRDA_UART);
+  return 0;
+}
+
+static int update_uart_state() {
+  int err;
+  if((irda.rx_enabled || irda.tx_enabled) && !irda.cd_enabled) {
+    if(irda.uart_enabled) {
+      return 0;
+    }
+    err = enable_uart();
+    if(!err) {
+      irda.uart_enabled = true;
+    }
+    return err;
+  } else {
+    if(!irda.uart_enabled) {
+      return 0;
+    }
+    err = disable_uart();
+    if(!err) {
+      irda.uart_enabled = false;
+    }
+    return err;
+  }
 }
 
 #define IRDA_LOG_LEVEL IRHAL_LOG_LEVEL_VERBOSE
@@ -105,11 +175,19 @@ static int irda_set_baudrate(uint32_t rate, void* priv) {
 }
 
 static int irda_tx_enable(void* priv) {
-  return 0;
+  int err;
+  irda.tx_enabled = true;
+  err = update_uart_state();
+  irda.tx_enabled = !err;
+  return err;
 }
 
 static int irda_tx_disable(void* priv) {
-  return 0;
+  int err;
+  irda.tx_enabled = false;
+  err = update_uart_state();
+  irda.tx_enabled = !!err;
+  return err;
 }
 
 static ssize_t irda_tx(const void* data, size_t len, void* priv) {
@@ -117,13 +195,21 @@ static ssize_t irda_tx(const void* data, size_t len, void* priv) {
 }
 
 static int irda_rx_enable(const struct irphy* phy, irphy_rx_cb cb, void* priv) {
+  int err;
   irda.rx_cb = cb;
-  return 0;
+  irda.rx_enabled = true;
+  err = update_uart_state();
+  irda.rx_enabled = !err;
+  return err;
 }
 
 static int irda_rx_disable(void* priv) {
+  int err;
   irda.rx_cb = NULL;
-  return 0;
+  irda.rx_enabled = false;
+  err = update_uart_state();
+  irda.rx_enabled = !!err;
+  return err;
 }
 
 static ssize_t irda_rx(void* data, size_t len, void* priv) {
@@ -138,7 +224,7 @@ static ssize_t irda_rx(void* data, size_t len, void* priv) {
 static void uart_event_task(void* arg) {
   while(1) {
     uart_event_t event;
-    if(xQueueReceive(&irda.uart_queue, (void*)&event, portMAX_DELAY)) {
+    if(xQueueReceive(&irda.uart_queue, (void*)&event, 1/pdMS_TO_TICKS());
       switch(event.type) {
         case UART_DATA:
           if(irda.rx_cb) {
@@ -161,16 +247,12 @@ static void uart_event_task(void* arg) {
           ESP_LOGW(TAG, "Unhandled uart event %d", event.type);
           break;
       }
+    } else {
+      ESP_LOGI(TAG, "Failed to get event from uart queue, killed? Bailing out");
+      break;
     }
   }
-}
-
-static void uart_enable() {
-  ESP_ERROR_CHECK(uart_set_pin(IRDA_UART, IRDA_TX_GPIO, IRDA_RX_GPIO, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-  ESP_ERROR_CHECK(uart_driver_install(IRDA_UART, 256, 1024, 0, NULL, 0));
-  ESP_ERROR_CHECK(uart_set_mode(IRDA_UART, UART_MODE_IRDA));
-
-  UART2.conf0.irda_tx_en = 1;
+  vTaskDelete(NULL);
 }
 
 static void cd_task(void* arg) {
@@ -191,34 +273,65 @@ static void IRAM_ATTR cd_isr(void* priv) {
 }
 
 static int irda_cd_enable(const struct irphy* phy, irphy_carrier_cb cb, void* priv) {
-  esp_err_t err;
+  int err;
   gpio_config_t gpio_conf = {
     .intr_type = GPIO_PIN_INTR_NEGEDGE,
     .pin_bit_mask = 1ULL << IRDA_RX_GPIO,
     .mode = GPIO_MODE_INPUT,
   };
-  uart_driver_delete(IRDA_UART);
-  gpio_install_isr_service(0);
   irda.cd_cb = cb;
+  irda.cd_enabled = true;
+  err = update_uart_state();
+  if(err) {
+    irda.cd_enabled = false;
+    goto fail;
+  }
+
   err = gpio_config(&gpio_conf);
   if(err) {
-    return -err;
+    goto fail_update_state;
   }
-  return -gpio_isr_handler_add(IRDA_RX_GPIO, cd_isr, NULL);
+  err = gpio_isr_handler_add(IRDA_RX_GPIO, cd_isr, NULL);
+  if(err) {
+    goto fail_update_state;
+  }
+
+  return 0;
+
+fail_update_state:
+  irda.cd_enabled = false;
+  err = update_uart_state();
+  irda.cd_enabled = !!err;
+fail:
+  return -err;
 }
 
 static int irda_cd_disable(void* priv) {
-  gpio_isr_handler_remove(IRDA_RX_GPIO);
-  uart_enable();
-  return 0;
+  int err;
+  err = gpio_isr_handler_remove(IRDA_RX_GPIO);
+  if(err) {
+    goto fail;
+  }
+
+  irda.cd_enabled = false;
+  err = update_uart_state();
+  irda.cd_enabled = !!err;
+
+fail:
+  return -err;
 }
 
 static void irda_carrier_cb(bool detected, void* arg) {
   ESP_LOGI(TAG, "carrier detect cb");
   ESP_LOGI(TAG, "Carrier detection finished, %s", detected ? "carrier detected" : "no carrier detected");
+  ESP_ERROR_CHECK(irda_cd_disable(NULL));
 }
 
 int app_main() {
+  memset(&irda, 0, sizeof(irda));
+
+  gpio_install_isr_service(0);
+
   esp_timer_create_args_t timer_args = {
     .callback = app_irda_timer_cb,
     .dispatch_method = ESP_TIMER_TASK,
@@ -249,9 +362,8 @@ int app_main() {
   };
 
   ESP_ERROR_CHECK(uart_param_config(IRDA_UART, &uart_config));
-  uart_enable();
+  irda_tx_enable(NULL);
 
-//  xTaskCreate(uart_event_task, "uart_event_task", 4096, NULL, 12, NULL);
   xTaskCreate(cd_task, "carrier_detect_task", 4096, NULL, 12, &irda.cd_task);
 
   struct irphy_hal_ops phy_hal_ops = {
