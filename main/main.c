@@ -17,6 +17,7 @@
 
 #define IRDA_TX_GPIO 23
 #define IRDA_RX_GPIO 22
+#define IRDA_PC_GPIO 19
 
 #define IRDA_UART    UART_NUM_2
 #define IRDA_PC      PCNT_UNIT_0
@@ -125,45 +126,6 @@ fail:
   return err;
 }
 
-static int disable_uart() {
-  uart_event_t event = {
-    .type = UART_EVENT_MAX,
-  };
-  ESP_LOGI(TAG, "Disabling uart");
-  ESP_LOGI(TAG, "Sending termination request to uart event task");
-  xQueueSend(irda.uart_queue, &event, portMAX_DELAY);
-  ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-  ESP_LOGI(TAG, "Got termination notification from uart event task");
-  uart_driver_delete(IRDA_UART);
-  return 0;
-}
-
-static int update_uart_state() {
-  int err;
-  ESP_LOGI(TAG, "Updating uart state");
-  if((irda.rx_enabled || irda.tx_enabled) && !irda.cd_enabled) {
-    if(irda.uart_enabled) {
-      ESP_LOGI(TAG, "UART already enabled");
-      return 0;
-    }
-    err = enable_uart();
-    if(!err) {
-      irda.uart_enabled = true;
-    }
-    return err;
-  } else {
-    if(!irda.uart_enabled) {
-      ESP_LOGI(TAG, "UART already disabled");
-      return 0;
-    }
-    err = disable_uart();
-    if(!err) {
-      irda.uart_enabled = false;
-    }
-    return err;
-  }
-}
-
 #define IRDA_LOG_LEVEL IRHAL_LOG_LEVEL_VERBOSE
 
 static char print_buf[1024];
@@ -205,19 +167,13 @@ static int irda_set_baudrate(uint32_t rate, void* priv) {
 }
 
 static int irda_tx_enable(void* priv) {
-  int err;
   irda.tx_enabled = true;
-  err = update_uart_state();
-  irda.tx_enabled = !err;
-  return err;
+  return 0;
 }
 
 static int irda_tx_disable(void* priv) {
-  int err;
   irda.tx_enabled = false;
-  err = update_uart_state();
-  irda.tx_enabled = !!err;
-  return err;
+  return 0;
 }
 
 static ssize_t irda_tx(const void* data, size_t len, void* priv) {
@@ -225,21 +181,15 @@ static ssize_t irda_tx(const void* data, size_t len, void* priv) {
 }
 
 static int irda_rx_enable(const struct irphy* phy, irphy_rx_cb cb, void* priv) {
-  int err;
   irda.rx_cb = cb;
   irda.rx_enabled = true;
-  err = update_uart_state();
-  irda.rx_enabled = !err;
-  return err;
+  return 0;
 }
 
 static int irda_rx_disable(void* priv) {
-  int err;
-  irda.rx_cb = NULL;
   irda.rx_enabled = false;
-  err = update_uart_state();
-  irda.rx_enabled = !!err;
-  return err;
+  irda.rx_cb = NULL;
+  return 0;
 }
 
 static ssize_t irda_rx(void* data, size_t len, void* priv) {
@@ -309,7 +259,7 @@ static void IRAM_ATTR cd_isr(void* priv) {
 static int irda_cd_enable(const struct irphy* phy, irphy_carrier_cb cb, void* priv) {
   int err;
   pcnt_config_t pc_conf = {
-    .pulse_gpio_num = IRDA_RX_GPIO,
+    .pulse_gpio_num = IRDA_PC_GPIO,
     .ctrl_gpio_num = PCNT_PIN_NOT_USED,
     .pos_mode = PCNT_COUNT_DIS,
     .neg_mode = PCNT_COUNT_INC,
@@ -319,15 +269,11 @@ static int irda_cd_enable(const struct irphy* phy, irphy_carrier_cb cb, void* pr
   };
   irda.cd_cb = cb;
   irda.cd_enabled = true;
-  err = update_uart_state();
-  if(err) {
-    irda.cd_enabled = false;
-    goto fail;
-  }
 
   err = pcnt_unit_config(&pc_conf);
   if(err) {
-    goto fail_update_state;
+    irda.cd_enabled = false;
+    goto fail;
   }
   pcnt_counter_clear(IRDA_PC);
   pcnt_set_event_value(IRDA_PC, PCNT_EVT_THRES_0, IRDA_PC_TRSH);
@@ -337,15 +283,11 @@ static int irda_cd_enable(const struct irphy* phy, irphy_carrier_cb cb, void* pr
 
   err = pcnt_isr_handler_add(IRDA_PC, cd_isr, NULL);
   if(err) {
-    goto fail_update_state;
+    goto fail;
   }
 
   return 0;
 
-fail_update_state:
-  irda.cd_enabled = false;
-  err = update_uart_state();
-  irda.cd_enabled = !!err;
 fail:
   return -err;
 }
@@ -370,8 +312,6 @@ static int irda_cd_disable(void* priv) {
   pcnt_unit_config(&pc_conf);
 
   irda.cd_enabled = false;
-  err = update_uart_state();
-  irda.cd_enabled = !!err;
 
 fail:
   return -err;
@@ -413,6 +353,7 @@ int app_main() {
   };
 
   ESP_ERROR_CHECK(irhal_init(&irda.hal, &hal_ops, 1000000000ULL, 1000));
+  enable_uart();
 
   irda_tx_enable(NULL);
 
@@ -440,7 +381,7 @@ int app_main() {
     ESP_LOGI("IRDA TIMER", "Timer id: %d", timerid);
     vTaskDelay(3000 / portTICK_PERIOD_MS);
     ESP_LOGI(TAG, "Starting carrier detection");
-//    ESP_ERROR_CHECK(irphy_run_cd(&irda.phy, &cd_duration, irda_carrier_cb, NULL));
+    ESP_ERROR_CHECK(irphy_run_cd(&irda.phy, &cd_duration, irda_carrier_cb, NULL));
     irda_tx_disable(NULL);
     vTaskDelay(3000 / portTICK_PERIOD_MS);
   }
