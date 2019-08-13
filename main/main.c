@@ -367,6 +367,10 @@ static void irda_carrier_cb(bool detected, void* arg) {
   ESP_ERROR_CHECK(irda_cd_disable(NULL));
 }
 
+int irda_tx_wait(void* arg) {
+  return uart_wait_tx_done(IRDA_UART, portMAX_DELAY);
+}
+
 int app_main() {
   memset(&irda, 0, sizeof(irda));
   irda.main_task = xTaskGetCurrentTaskHandle();
@@ -411,6 +415,7 @@ int app_main() {
     .set_baudrate = irda_set_baudrate,
     .tx_enable = irda_tx_enable,
     .tx = irda_tx,
+    .tx_wait = irda_tx_wait,
     .tx_disable = irda_tx_disable,
     .rx_enable = irda_rx_enable,
     .rx = irda_rx,
