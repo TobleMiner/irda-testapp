@@ -71,6 +71,11 @@ static int app_clear_irda_timer(void* arg) {
   return -esp_timer_stop(irda.timer);
 }
 
+static int app_get_random_bytes(uint8_t* buf, size_t len, void* arg) {
+  esp_fill_random(buf, len);
+  return 0;
+};
+
 time_ns_t timeout = { .sec = 0, .nsec = 500000000UL };
 
 
@@ -218,12 +223,12 @@ static void uart_event_task(void* arg) {
         case UART_FIFO_OVF:
           ESP_LOGW(TAG, "hw fifo overflow");
           uart_flush_input(IRDA_UART);
-          xQueueReset(&irda.uart_queue);
+          xQueueReset(irda.uart_queue);
           break;
         case UART_BUFFER_FULL:
           ESP_LOGW(TAG, "ring buffer full");
           uart_flush_input(IRDA_UART);
-          xQueueReset(&irda.uart_queue);
+          xQueueReset(irda.uart_queue);
           break;
         case UART_EVENT_MAX:
           ESP_LOGI(TAG, "Terminating uart event task, MAX event received");
@@ -333,7 +338,7 @@ int app_main() {
   irda.main_task = xTaskGetCurrentTaskHandle();
   irda.baudrate = 9600;
 
-  irda_set_baudrate(115200, NULL);
+  irda_set_baudrate(9600, NULL);
 
   esp_timer_create_args_t timer_args = {
     .callback = app_irda_timer_cb,
@@ -351,6 +356,7 @@ int app_main() {
     .set_alarm = app_start_irda_timer,
     .clear_alarm = app_clear_irda_timer,
     .log = irda_log,
+    .get_random_bytes = app_get_random_bytes,
   };
 
   ESP_ERROR_CHECK(irhal_init(&irda.hal, &hal_ops, 1000000000ULL, 1000));
