@@ -13,6 +13,8 @@
 
 #include "irda/irhal/irhal.h"
 #include "irda/irphy/irphy.h"
+#include "irda/irlap/irlap.h"
+#include "irda/util/util.h"
 
 
 #define IRDA_TX_GPIO 23
@@ -54,6 +56,7 @@ struct {
   bool uart_enabled;
   TaskHandle_t main_task;
   uint32_t baudrate;
+  struct irlap lap;
 } irda;
 
 static void app_irda_timer_cb(void* arg) {
@@ -333,6 +336,17 @@ int irda_tx_wait(void* arg) {
   return uart_wait_tx_done(IRDA_UART, portMAX_DELAY);
 }
 
+void irda_rx_cb(struct irphy* phy, size_t len) {
+  uint8_t data[32];
+  uint8_t* dptr = data;
+  ESP_LOGI(TAG, "Received %zu bytes", len);
+  ssize_t len_ = irda_rx(data, min(sizeof(data), len), NULL);
+  while(len_-- > 0) {
+    printf("%02x ", *dptr++);
+  }
+  printf("\n");
+}
+
 int app_main() {
   memset(&irda, 0, sizeof(irda));
   irda.main_task = xTaskGetCurrentTaskHandle();
@@ -381,15 +395,24 @@ int app_main() {
 
   ESP_ERROR_CHECK(irphy_init(&irda.phy, &irda.hal, &phy_hal_ops));
 
+  struct irlap_ops lap_ops = {
+
+  };
+
+  ESP_ERROR_CHECK(irlap_init(&irda.lap, &irda.phy, &lap_ops));
+
+//  irda_rx_enable(&irda.phy, irda_rx_cb, NULL);
+
   while(1) {
     time_ns_t cd_duration = { .sec = 1, .nsec = 0 };
-    irda_tx_enable(NULL);
-    int timerid = irhal_set_timer(&irda.hal, &timeout, timer_cb, NULL);
-    ESP_LOGI("IRDA TIMER", "Timer id: %d", timerid);
-    vTaskDelay(3000 / portTICK_PERIOD_MS);
-    ESP_LOGI(TAG, "Starting carrier detection");
-    ESP_ERROR_CHECK(irphy_run_cd(&irda.phy, &cd_duration, irda_carrier_cb, NULL));
-    irda_tx_disable(NULL);
-    vTaskDelay(3000 / portTICK_PERIOD_MS);
+//    irda_tx_enable(NULL);
+//    int timerid = irhal_set_timer(&irda.hal, &timeout, timer_cb, NULL);
+//    ESP_LOGI("IRDA TIMER", "Timer id: %d", timerid);
+//    vTaskDelay(3000 / portTICK_PERIOD_MS);
+//    ESP_LOGI(TAG, "Starting carrier detection");
+//    ESP_ERROR_CHECK(irphy_run_cd(&irda.phy, &cd_duration, irda_carrier_cb, NULL));
+//    irda_tx_disable(NULL);
+    ESP_ERROR_CHECK(irlap_send_xir(&irda.lap));
+    vTaskDelay(5600 / portTICK_PERIOD_MS);
   }
 }
