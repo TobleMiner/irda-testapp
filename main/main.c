@@ -112,6 +112,7 @@ static int enable_uart() {
   }
 
   UART2.conf0.irda_tx_en = 1;
+  UART2.conf0.irda_dplx = 1;
 
   if(xTaskCreate(uart_event_task, "uart_event_task", 4096, NULL, 12, &irda.uart_event_task) != pdPASS) {
     err = -ENOMEM;
