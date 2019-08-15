@@ -28,7 +28,7 @@
 #define IRDA_PC_FLTR 20
 
 esp_err_t event_handler(void *ctx, system_event_t *event) {
-    return ESP_OK;
+  return ESP_OK;
 }
 
 #define TAG "IRDA"
@@ -60,13 +60,15 @@ struct {
 } irda;
 
 static void app_irda_timer_cb(void* arg) {
-  ESP_LOGI(TAG, "Calling alarm cb");
+//  ESP_LOGI(TAG, "Calling alarm cb");
   irda.alarm_cb(&irda.hal);
 }
 
 static int app_start_irda_timer(struct irhal* hal, irhal_alarm_cb cb, uint64_t timeout, void* arg) {
-  ESP_LOGI(TAG, "Scheduling timer in %llu µs", timeout);
-  irda.alarm_cb = cb;
+//  ESP_LOGI(TAG, "Scheduling timer in %llu µs", timeout);
+  if(!irda.alarm_cb) {
+    irda.alarm_cb = cb;
+  }
   return -esp_timer_start_once(irda.timer, timeout);
 }
 
@@ -119,13 +121,15 @@ static int enable_uart() {
     goto fail_driver;
   }
 
-  UART2.conf0.irda_tx_en = 1;
-  UART2.conf0.irda_dplx = 1;
+//  UART2.conf0.irda_tx_en = 1;
+//  UART2.conf0.irda_dplx = 1;
 
   if(xTaskCreate(uart_event_task, "uart_event_task", 4096, NULL, 12, &irda.uart_event_task) != pdPASS) {
     err = -ENOMEM;
     goto fail_driver;
   }
+
+  ESP_LOGI(TAG, "UART event task is %p", irda.uart_event_task);
 
   return 0;
 
@@ -177,11 +181,13 @@ static int irda_set_baudrate(uint32_t rate, void* priv) {
 
 static int irda_tx_enable(void* priv) {
   irda.tx_enabled = true;
+  UART2.conf0.irda_tx_en = 1;
   return 0;
 }
 
 static int irda_tx_disable(void* priv) {
   irda.tx_enabled = false;
+  UART2.conf0.irda_tx_en = 0;
   return 0;
 }
 
@@ -214,28 +220,30 @@ static void uart_event_task(void* arg) {
   while(1) {
     uart_event_t event;
     if(xQueueReceive(irda.uart_queue, (void*)&event, portMAX_DELAY)) {
-      ESP_LOGI(TAG, "Got uart event");
       switch(event.type) {
         case UART_DATA:
-          if(irda.rx_cb) {
+          irlap_uart_event(&irda.lap, IRLAP_UART_DATA_RX);
+/*          if(irda.rx_cb) {
             size_t buffered_len;
             uart_get_buffered_data_len(IRDA_UART, &buffered_len);
             irda.rx_cb(&irda.phy, buffered_len);
           }
+*/
+          break;
+        case UART_FRAME_ERR:
+          irlap_uart_event(&irda.lap, IRLAP_UART_FRAMING_ERROR);
           break;
         case UART_FIFO_OVF:
+          irlap_uart_event(&irda.lap, IRLAP_UART_RX_OVERFLOW);
           ESP_LOGW(TAG, "hw fifo overflow");
           uart_flush_input(IRDA_UART);
           xQueueReset(irda.uart_queue);
           break;
         case UART_BUFFER_FULL:
+          irlap_uart_event(&irda.lap, IRLAP_UART_RX_OVERFLOW);
           ESP_LOGW(TAG, "ring buffer full");
           uart_flush_input(IRDA_UART);
           xQueueReset(irda.uart_queue);
-          break;
-        case UART_EVENT_MAX:
-          ESP_LOGI(TAG, "Terminating uart event task, MAX event received");
-          xTaskNotifyGive(irda.main_task);
           break;
         default:
           ESP_LOGW(TAG, "Unhandled uart event %d", event.type);
@@ -359,7 +367,7 @@ int irda_lock_alloc(void** lock, void* priv) {
     goto fail;
   }
 
-  irdalock->lock = xSemaphoreCreateMutex();
+  irdalock->lock = xSemaphoreCreateRecursiveMutex();
   if(!irdalock->lock) {
     err = -ENOMEM;
     goto fail_alloc;
@@ -376,12 +384,12 @@ fail:
 
 void irda_lock_take(void* lock, void* priv) {
   struct irda_lock* irdalock = lock;
-  xSemaphoreTake(irdalock->lock, portMAX_DELAY);
+  xSemaphoreTakeRecursive(irdalock->lock, portMAX_DELAY);
 }
 
 void irda_lock_put(void* lock, void* priv) {
   struct irda_lock* irdalock = lock;
-  xSemaphoreGive(irdalock->lock);
+  xSemaphoreGiveRecursive(irdalock->lock);
 }
 
 void irda_lock_free(void* lock, void* priv) {
@@ -390,11 +398,16 @@ void irda_lock_free(void* lock, void* priv) {
   free(irdalock);
 }
 
+static int irda_discovery_confirm(irlap_discovery_result_t result, irlap_discovery_log_list_t* list, void* priv) {
+  return 0;
+}
+
 int app_main() {
   memset(&irda, 0, sizeof(irda));
   irda.main_task = xTaskGetCurrentTaskHandle();
   irda.baudrate = 9600;
 
+  ESP_LOGI(TAG, "Main task is %p", irda.main_task);
   irda_set_baudrate(9600, NULL);
 
   esp_timer_create_args_t timer_args = {
@@ -421,11 +434,9 @@ int app_main() {
   };
 
   ESP_ERROR_CHECK(irhal_init(&irda.hal, &hal_ops, 1000000000ULL, 1000));
-  enable_uart();
-
-  irda_tx_enable(NULL);
 
   xTaskCreate(cd_task, "carrier_detect_task", 4096, NULL, 12, &irda.cd_task);
+  ESP_LOGI(TAG, "CD task is %p", irda.cd_task);
 
   struct irphy_hal_ops phy_hal_ops = {
     .set_baudrate = irda_set_baudrate,
@@ -443,10 +454,12 @@ int app_main() {
   ESP_ERROR_CHECK(irphy_init(&irda.phy, &irda.hal, &phy_hal_ops));
 
   struct irlap_ops lap_ops = {
-
   };
 
   ESP_ERROR_CHECK(irlap_init(&irda.lap, &irda.phy, &lap_ops, NULL));
+  irda.lap.discovery.ops.confirm = irda_discovery_confirm;
+
+  enable_uart();
 
 //  irda_rx_enable(&irda.phy, irda_rx_cb, NULL);
 
@@ -460,8 +473,7 @@ int app_main() {
 //    ESP_LOGI(TAG, "Starting carrier detection");
 //    ESP_ERROR_CHECK(irphy_run_cd(&irda.phy, &cd_duration, irda_carrier_cb, NULL));
 //    irda_tx_disable(NULL);
-//    ESP_ERROR_CHECK(irlap_send_xir(&irda.lap));
-    ESP_ERROR_CHECK(irlap_discovery_request(&irda.lap.discovery, 6, (uint8_t*)info, sizeof(info)));
-    vTaskDelay(5600 / portTICK_PERIOD_MS);
+    irlap_discovery_request(&irda.lap.discovery, 6, (uint8_t*)info, sizeof(info));
+    vTaskDelay(500 / portTICK_PERIOD_MS);
   }
 }
