@@ -347,6 +347,49 @@ void irda_rx_cb(struct irphy* phy, size_t len) {
   printf("\n");
 }
 
+struct irda_lock {
+  SemaphoreHandle_t lock;
+};
+
+int irda_lock_alloc(void** lock, void* priv) {
+  int err;
+  struct irda_lock* irdalock = malloc(sizeof(struct irda_lock));
+  if(!irdalock) {
+    err = -ENOMEM;
+    goto fail;
+  }
+
+  irdalock->lock = xSemaphoreCreateMutex();
+  if(!irdalock->lock) {
+    err = -ENOMEM;
+    goto fail_alloc;
+  }
+
+  *lock = irdalock;
+  return 0;
+
+fail_alloc:
+  free(lock);
+fail:
+  return err;
+}
+
+void irda_lock_take(void* lock, void* priv) {
+  struct irda_lock* irdalock = lock;
+  xSemaphoreTake(irdalock->lock, portMAX_DELAY);
+}
+
+void irda_lock_put(void* lock, void* priv) {
+  struct irda_lock* irdalock = lock;
+  xSemaphoreGive(irdalock->lock);
+}
+
+void irda_lock_free(void* lock, void* priv) {
+  struct irda_lock* irdalock = lock;
+  vSemaphoreDelete(irdalock->lock);
+  free(irdalock);
+}
+
 int app_main() {
   memset(&irda, 0, sizeof(irda));
   irda.main_task = xTaskGetCurrentTaskHandle();
@@ -371,6 +414,10 @@ int app_main() {
     .clear_alarm = app_clear_irda_timer,
     .log = irda_log,
     .get_random_bytes = app_get_random_bytes,
+    .lock_alloc = irda_lock_alloc,
+    .lock_free = irda_lock_free,
+    .lock_take = irda_lock_take,
+    .lock_put = irda_lock_put,
   };
 
   ESP_ERROR_CHECK(irhal_init(&irda.hal, &hal_ops, 1000000000ULL, 1000));
@@ -399,11 +446,12 @@ int app_main() {
 
   };
 
-  ESP_ERROR_CHECK(irlap_init(&irda.lap, &irda.phy, &lap_ops));
+  ESP_ERROR_CHECK(irlap_init(&irda.lap, &irda.phy, &lap_ops, NULL));
 
 //  irda_rx_enable(&irda.phy, irda_rx_cb, NULL);
 
   while(1) {
+    char* info = "ESP32";
     time_ns_t cd_duration = { .sec = 1, .nsec = 0 };
 //    irda_tx_enable(NULL);
 //    int timerid = irhal_set_timer(&irda.hal, &timeout, timer_cb, NULL);
@@ -412,7 +460,8 @@ int app_main() {
 //    ESP_LOGI(TAG, "Starting carrier detection");
 //    ESP_ERROR_CHECK(irphy_run_cd(&irda.phy, &cd_duration, irda_carrier_cb, NULL));
 //    irda_tx_disable(NULL);
-    ESP_ERROR_CHECK(irlap_send_xir(&irda.lap));
+//    ESP_ERROR_CHECK(irlap_send_xir(&irda.lap));
+    ESP_ERROR_CHECK(irlap_discovery_request(&irda.lap.discovery, 6, (uint8_t*)info, strlen(info)));
     vTaskDelay(5600 / portTICK_PERIOD_MS);
   }
 }
