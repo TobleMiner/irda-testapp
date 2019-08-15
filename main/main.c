@@ -19,13 +19,8 @@
 
 #define IRDA_TX_GPIO 23
 #define IRDA_RX_GPIO 22
-#define IRDA_PC_GPIO 19
 
 #define IRDA_UART    UART_NUM_2
-#define IRDA_PC      PCNT_UNIT_0
-#define IRDA_PC_CHAN PCNT_CHANNEL_0
-#define IRDA_PC_TRSH 32
-#define IRDA_PC_FLTR 20
 
 esp_err_t event_handler(void *ctx, system_event_t *event) {
   return ESP_OK;
@@ -47,13 +42,12 @@ struct {
   QueueHandle_t uart_queue;
   struct irphy phy;
   irphy_rx_cb rx_cb;
-  TaskHandle_t cd_task;
   TaskHandle_t uart_event_task;
-  irphy_carrier_cb cd_cb;
   bool rx_enabled;
   bool tx_enabled;
   bool cd_enabled;
   bool uart_enabled;
+  void* rx_cb_priv;
   TaskHandle_t main_task;
   uint32_t baudrate;
   struct irlap lap;
@@ -85,11 +79,6 @@ time_ns_t timeout = { .sec = 0, .nsec = 500000000UL };
 
 
 static ssize_t irda_tx(const void* data, size_t len, void* priv);
-
-static void timer_cb(void* ctx) {
-  ESP_LOGI("IRDA TIMER", "Timer fired");
-  irda_tx(str, strlen(str), NULL);
-}
 
 static void uart_event_task(void* arg);
 
@@ -195,7 +184,8 @@ static ssize_t irda_tx(const void* data, size_t len, void* priv) {
   return uart_write_bytes(IRDA_UART, (char*)data, len);
 }
 
-static int irda_rx_enable(const struct irphy* phy, irphy_rx_cb cb, void* priv) {
+static int irda_rx_enable(const struct irphy* phy, void* priv, irphy_rx_cb cb, void* cb_priv) {
+  irda.rx_cb_priv = cb_priv;
   irda.rx_cb = cb;
   irda.rx_enabled = true;
   return 0;
@@ -222,25 +212,28 @@ static void uart_event_task(void* arg) {
     if(xQueueReceive(irda.uart_queue, (void*)&event, portMAX_DELAY)) {
       switch(event.type) {
         case UART_DATA:
-          irlap_uart_event(&irda.lap, IRLAP_UART_DATA_RX);
-/*          if(irda.rx_cb) {
-            size_t buffered_len;
-            uart_get_buffered_data_len(IRDA_UART, &buffered_len);
-            irda.rx_cb(&irda.phy, buffered_len);
+          if(irda.rx_cb) {
+            irda.rx_cb(&irda.phy, IRPHY_EVENT_DATA_RX, irda.rx_cb_priv);
           }
-*/
+
           break;
         case UART_FRAME_ERR:
-          irlap_uart_event(&irda.lap, IRLAP_UART_FRAMING_ERROR);
+          if(irda.rx_cb) {
+            irda.rx_cb(&irda.phy, IRPHY_EVENT_FRAMING_ERROR, irda.rx_cb_priv);
+          }
           break;
         case UART_FIFO_OVF:
-          irlap_uart_event(&irda.lap, IRLAP_UART_RX_OVERFLOW);
+          if(irda.rx_cb) {
+            irda.rx_cb(&irda.phy, IRPHY_EVENT_RX_OVERFLOW, irda.rx_cb_priv);
+          }
           ESP_LOGW(TAG, "hw fifo overflow");
           uart_flush_input(IRDA_UART);
           xQueueReset(irda.uart_queue);
           break;
         case UART_BUFFER_FULL:
-          irlap_uart_event(&irda.lap, IRLAP_UART_RX_OVERFLOW);
+          if(irda.rx_cb) {
+            irda.rx_cb(&irda.phy, IRPHY_EVENT_RX_OVERFLOW, irda.rx_cb_priv);
+          }
           ESP_LOGW(TAG, "ring buffer full");
           uart_flush_input(IRDA_UART);
           xQueueReset(irda.uart_queue);
@@ -255,104 +248,8 @@ static void uart_event_task(void* arg) {
   vTaskDelete(NULL);
 }
 
-static void cd_task(void* arg) {
-  while(1) {
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-    ESP_LOGI(TAG, "Got carrier detect notification");
-    if(irda.cd_cb) {
-      irda.cd_cb(&irda.phy);
-    }
-  }
-}
-
-static void IRAM_ATTR cd_isr(void* priv) {
-  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-  vTaskNotifyGiveFromISR(irda.cd_task, &xHigherPriorityTaskWoken);
-  if(xHigherPriorityTaskWoken == pdTRUE) {
-    portYIELD_FROM_ISR();
-  }
-}
-
-static int irda_cd_enable(const struct irphy* phy, irphy_carrier_cb cb, void* priv) {
-  int err;
-  pcnt_config_t pc_conf = {
-    .pulse_gpio_num = IRDA_PC_GPIO,
-    .ctrl_gpio_num = PCNT_PIN_NOT_USED,
-    .pos_mode = PCNT_COUNT_DIS,
-    .neg_mode = PCNT_COUNT_INC,
-    .counter_h_lim = SHRT_MAX,
-    .unit = IRDA_PC,
-    .channel = IRDA_PC_CHAN,
-  };
-  irda.cd_cb = cb;
-  irda.cd_enabled = true;
-
-  err = pcnt_unit_config(&pc_conf);
-  if(err) {
-    irda.cd_enabled = false;
-    goto fail;
-  }
-  pcnt_counter_clear(IRDA_PC);
-  pcnt_set_event_value(IRDA_PC, PCNT_EVT_THRES_0, IRDA_PC_TRSH);
-  pcnt_set_filter_value(IRDA_PC,IRDA_PC_FLTR);
-  pcnt_intr_enable(IRDA_PC);
-  pcnt_event_enable(IRDA_PC, PCNT_EVT_THRES_0);
-
-  err = pcnt_isr_handler_add(IRDA_PC, cd_isr, NULL);
-  if(err) {
-    goto fail;
-  }
-
-  return 0;
-
-fail:
-  return -err;
-}
-
-static int irda_cd_disable(void* priv) {
-  int err;
-  pcnt_config_t pc_conf = {
-    .pulse_gpio_num = PCNT_PIN_NOT_USED,
-    .ctrl_gpio_num = PCNT_PIN_NOT_USED,
-    .pos_mode = PCNT_COUNT_DIS,
-    .neg_mode = PCNT_COUNT_INC,
-    .counter_h_lim = SHRT_MAX,
-    .unit = IRDA_PC,
-    .channel = IRDA_PC_CHAN,
-  };
-  err = pcnt_isr_handler_remove(IRDA_PC);
-  if(err) {
-    goto fail;
-  }
-
-  // Deconfigure pulse counter
-  pcnt_unit_config(&pc_conf);
-
-  irda.cd_enabled = false;
-
-fail:
-  return -err;
-}
-
-static void irda_carrier_cb(bool detected, void* arg) {
-  ESP_LOGI(TAG, "carrier detect cb");
-  ESP_LOGI(TAG, "Carrier detection finished, %s", detected ? "carrier detected" : "no carrier detected");
-  ESP_ERROR_CHECK(irda_cd_disable(NULL));
-}
-
 int irda_tx_wait(void* arg) {
   return uart_wait_tx_done(IRDA_UART, portMAX_DELAY);
-}
-
-void irda_rx_cb(struct irphy* phy, size_t len) {
-  uint8_t data[32];
-  uint8_t* dptr = data;
-  ESP_LOGI(TAG, "Received %zu bytes", len);
-  ssize_t len_ = irda_rx(data, min(sizeof(data), len), NULL);
-  while(len_-- > 0) {
-    printf("%02x ", *dptr++);
-  }
-  printf("\n");
 }
 
 struct irda_lock {
@@ -435,9 +332,6 @@ int app_main() {
 
   ESP_ERROR_CHECK(irhal_init(&irda.hal, &hal_ops, 1000000000ULL, 1000));
 
-  xTaskCreate(cd_task, "carrier_detect_task", 4096, NULL, 12, &irda.cd_task);
-  ESP_LOGI(TAG, "CD task is %p", irda.cd_task);
-
   struct irphy_hal_ops phy_hal_ops = {
     .set_baudrate = irda_set_baudrate,
     .tx_enable = irda_tx_enable,
@@ -447,8 +341,6 @@ int app_main() {
     .rx_enable = irda_rx_enable,
     .rx = irda_rx,
     .rx_disable = irda_rx_disable,
-    .cd_enable = irda_cd_enable,
-    .cd_disable = irda_cd_disable,
   };
 
   ESP_ERROR_CHECK(irphy_init(&irda.phy, &irda.hal, &phy_hal_ops));
@@ -461,11 +353,8 @@ int app_main() {
 
   enable_uart();
 
-//  irda_rx_enable(&irda.phy, irda_rx_cb, NULL);
-
   while(1) {
     char info[18] = "\004\000libirda on ESP32";
-    time_ns_t cd_duration = { .sec = 1, .nsec = 0 };
 //    irda_tx_enable(NULL);
 //    int timerid = irhal_set_timer(&irda.hal, &timeout, timer_cb, NULL);
 //    ESP_LOGI("IRDA TIMER", "Timer id: %d", timerid);
