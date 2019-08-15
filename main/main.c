@@ -451,7 +451,7 @@ int app_main() {
 //  irda_rx_enable(&irda.phy, irda_rx_cb, NULL);
 
   while(1) {
-    char* info = "ESP32";
+    char info[18] = "\004\000libirda on ESP32";
     time_ns_t cd_duration = { .sec = 1, .nsec = 0 };
 //    irda_tx_enable(NULL);
 //    int timerid = irhal_set_timer(&irda.hal, &timeout, timer_cb, NULL);
@@ -461,7 +461,7 @@ int app_main() {
 //    ESP_ERROR_CHECK(irphy_run_cd(&irda.phy, &cd_duration, irda_carrier_cb, NULL));
 //    irda_tx_disable(NULL);
 //    ESP_ERROR_CHECK(irlap_send_xir(&irda.lap));
-    ESP_ERROR_CHECK(irlap_discovery_request(&irda.lap.discovery, 6, (uint8_t*)info, strlen(info)));
+    ESP_ERROR_CHECK(irlap_discovery_request(&irda.lap.discovery, 6, (uint8_t*)info, sizeof(info)));
     vTaskDelay(5600 / portTICK_PERIOD_MS);
   }
 }
