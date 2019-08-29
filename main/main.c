@@ -239,7 +239,7 @@ static void uart_event_task(void* arg) {
           xQueueReset(irda.uart_queue);
           break;
         default:
-          ESP_LOGW(TAG, "Unhandled uart event %d", event.type);
+//          ESP_LOGW(TAG, "Unhandled uart event %d", event.type);
           break;
       }
     }
