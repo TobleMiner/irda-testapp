@@ -4,6 +4,7 @@
 #
 
 PROJECT_NAME := irda
+CFLAGS = -O2
 
 include $(IDF_PATH)/make/project.mk
 
