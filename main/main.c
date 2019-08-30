@@ -31,6 +31,8 @@ esp_err_t event_handler(void *ctx, system_event_t *event) {
 
 const char* str = "This is an IRDA SIR message\n\r";
 
+char info[18] = "\004\000libirda on ESP32";
+
 static uint64_t app_get_time(void* priv) {
   return esp_timer_get_time();
 }
@@ -264,7 +266,7 @@ int irda_lock_alloc(void** lock, void* priv) {
     goto fail;
   }
 
-  irdalock->lock = xSemaphoreCreateRecursiveMutex();
+  irdalock->lock = xSemaphoreCreateMutex();
   if(!irdalock->lock) {
     err = -ENOMEM;
     goto fail_alloc;
@@ -281,12 +283,12 @@ fail:
 
 void irda_lock_take(void* lock, void* priv) {
   struct irda_lock* irdalock = lock;
-  xSemaphoreTakeRecursive(irdalock->lock, portMAX_DELAY);
+  xSemaphoreTake(irdalock->lock, portMAX_DELAY);
 }
 
 void irda_lock_put(void* lock, void* priv) {
   struct irda_lock* irdalock = lock;
-  xSemaphoreGiveRecursive(irdalock->lock);
+  xSemaphoreGive(irdalock->lock);
 }
 
 void irda_lock_free(void* lock, void* priv) {
@@ -295,8 +297,81 @@ void irda_lock_free(void* lock, void* priv) {
   free(irdalock);
 }
 
-static int irda_discovery_confirm(irlap_discovery_result_t result, irlap_discovery_log_list_t* list, void* priv) {
+int irda_lock_alloc_reentrant(void** lock, void* priv) {
+  int err;
+  struct irda_lock* irdalock = malloc(sizeof(struct irda_lock));
+  if(!irdalock) {
+    err = -ENOMEM;
+    goto fail;
+  }
+
+  irdalock->lock = xSemaphoreCreateRecursiveMutex();
+  if(!irdalock->lock) {
+    err = -ENOMEM;
+    goto fail_alloc;
+  }
+
+  *lock = irdalock;
   return 0;
+
+fail_alloc:
+  free(lock);
+fail:
+  return err;
+}
+
+void irda_lock_take_reentrant(void* lock, void* priv) {
+  struct irda_lock* irdalock = lock;
+  xSemaphoreTakeRecursive(irdalock->lock, portMAX_DELAY);
+}
+
+void irda_lock_put_reentrant(void* lock, void* priv) {
+  struct irda_lock* irdalock = lock;
+  xSemaphoreGiveRecursive(irdalock->lock);
+}
+
+static int irda_new_address_confirm(irlap_discovery_result_t result, irlap_discovery_log_list_t* list, void* priv) {
+  if(result == IRLAP_DISCOVERY_RESULT_MEDIA_BUSY) {
+    ESP_LOGI(TAG, "Discovery failed, media busy");
+    irlap_discovery_request(&irda.lap.discovery, 6, (uint8_t*)info, sizeof(info));
+    return 0;
+  }
+  if(result == IRLAP_DISCOVERY_RESULT_OK) {
+    ESP_LOGI(TAG, "=====RENUMBERED DEVICES=====");
+    irlap_discovery_log_list_t *cursor;
+    LIST_FOR_EACH(cursor, list) {
+      struct irlap_discovery_log_entry* entry = LIST_GET_ENTRY(cursor, struct irlap_discovery_log_entry, list);
+      ESP_LOGI(TAG, "Address: %08x", entry->discovery_log.device_address);
+    }
+    ESP_LOGI(TAG, "=====DEVICE LIST END=====");
+  }
+  return 0;
+}
+
+static int irda_discovery_confirm(irlap_discovery_result_t result, irlap_discovery_log_list_t* list, void* priv) {
+  if(result == IRLAP_DISCOVERY_RESULT_MEDIA_BUSY) {
+    ESP_LOGI(TAG, "Discovery failed, media busy");
+    irlap_discovery_request(&irda.lap.discovery, 6, (uint8_t*)info, sizeof(info));
+    return 0;
+  }
+  ESP_LOGI(TAG, "Discovery finished");
+  if(result == IRLAP_DISCOVERY_RESULT_OK) {
+    ESP_LOGI(TAG, "=======DEVICE LIST=======");
+    irlap_discovery_log_list_t *cursor;
+    irlap_addr_t addr = 0;
+    LIST_FOR_EACH(cursor, list) {
+      struct irlap_discovery_log_entry* entry = LIST_GET_ENTRY(cursor, struct irlap_discovery_log_entry, list);
+      ESP_LOGI(TAG, "Address: %08x", entry->discovery_log.device_address);
+      addr = entry->discovery_log.device_address;
+    }
+    irlap_new_address_request(&irda.lap.discovery, 6, NULL, 0, addr);
+    ESP_LOGI(TAG, "=====DEVICE LIST END=====");
+  }
+  return 0;
+}
+
+static void event_task_wrapper(void* arg) {
+  irlap_event_loop(&irda.lap);
 }
 
 int app_main() {
@@ -328,6 +403,10 @@ int app_main() {
     .lock_free = irda_lock_free,
     .lock_take = irda_lock_take,
     .lock_put = irda_lock_put,
+    .lock_alloc_reentrant = irda_lock_alloc_reentrant,
+    .lock_free_reentrant = irda_lock_free,
+    .lock_take_reentrant = irda_lock_take_reentrant,
+    .lock_put_reentrant = irda_lock_put_reentrant,
   };
 
   ESP_ERROR_CHECK(irhal_init(&irda.hal, &hal_ops, 1000000000ULL, 1000));
@@ -349,12 +428,19 @@ int app_main() {
   };
 
   ESP_ERROR_CHECK(irlap_init(&irda.lap, &irda.phy, &lap_ops, NULL));
-  irda.lap.discovery.ops.confirm = irda_discovery_confirm;
+  irda.lap.discovery.discovery_ops.confirm = irda_discovery_confirm;
+  irda.lap.discovery.new_address_ops.confirm = irda_new_address_confirm;
+
+  if(xTaskCreate(event_task_wrapper, "event_task_wrapper", 4096, NULL, 12, NULL) != pdPASS) {
+    ESP_LOGE(TAG, "Failed to create event task, dying");
+    ESP_ERROR_CHECK(ESP_FAIL);
+  };
 
   enable_uart();
 
+  irlap_discovery_request(&irda.lap.discovery, 6, (uint8_t*)info, sizeof(info));
+
   while(1) {
-    char info[18] = "\004\000libirda on ESP32";
 //    irda_tx_enable(NULL);
 //    int timerid = irhal_set_timer(&irda.hal, &timeout, timer_cb, NULL);
 //    ESP_LOGI("IRDA TIMER", "Timer id: %d", timerid);
@@ -362,7 +448,6 @@ int app_main() {
 //    ESP_LOGI(TAG, "Starting carrier detection");
 //    ESP_ERROR_CHECK(irphy_run_cd(&irda.phy, &cd_duration, irda_carrier_cb, NULL));
 //    irda_tx_disable(NULL);
-    irlap_discovery_request(&irda.lap.discovery, 6, (uint8_t*)info, sizeof(info));
-    vTaskDelay(500 / portTICK_PERIOD_MS);
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
   }
 }
