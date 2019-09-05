@@ -351,7 +351,7 @@ static int irda_new_address_confirm(irlap_discovery_result_t result, irlap_disco
 static int irda_discovery_confirm(irlap_discovery_result_t result, irlap_discovery_log_list_t* list, void* priv) {
   if(result == IRLAP_DISCOVERY_RESULT_MEDIA_BUSY) {
     ESP_LOGI(TAG, "Discovery failed, media busy");
-    irlap_discovery_request(&irda.lap.discovery, 6, (uint8_t*)info, sizeof(info));
+//    irlap_discovery_request(&irda.lap.discovery, 6, (uint8_t*)info, sizeof(info));
     return 0;
   }
   ESP_LOGI(TAG, "Discovery finished");
@@ -364,7 +364,7 @@ static int irda_discovery_confirm(irlap_discovery_result_t result, irlap_discove
       ESP_LOGI(TAG, "Address: %08x", entry->discovery_log.device_address);
       addr = entry->discovery_log.device_address;
     }
-    irlap_new_address_request(&irda.lap.discovery, 6, NULL, 0, addr);
+//    irlap_new_address_request(&irda.lap.discovery, 6, NULL, 0, addr);
     ESP_LOGI(TAG, "=====DEVICE LIST END=====");
   }
   return 0;
