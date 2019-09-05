@@ -374,6 +374,10 @@ static void event_task_wrapper(void* arg) {
   irlap_event_loop(&irda.lap);
 }
 
+static void irda_test_resp_handler(irlap_addr_t src_address, uint8_t* data, size_t data_len, void* priv) {
+  ESP_LOGI(TAG, "Got test reponse from %08x: %.*s", src_address, data_len, (char*)data);
+}
+
 int app_main() {
   memset(&irda, 0, sizeof(irda));
   irda.main_task = xTaskGetCurrentTaskHandle();
@@ -432,6 +436,7 @@ int app_main() {
   ESP_ERROR_CHECK(irlap_init(&irda.lap, &irda.phy, &lap_ops, NULL));
   irda.lap.discovery.discovery_ops.confirm = irda_discovery_confirm;
   irda.lap.discovery.new_address_ops.confirm = irda_new_address_confirm;
+  irda.lap.services.test.confirm = irda_test_resp_handler;
 
   if(xTaskCreate(event_task_wrapper, "event_task_wrapper", 4096, NULL, 12, NULL) != pdPASS) {
     ESP_LOGE(TAG, "Failed to create event task, dying");
@@ -440,9 +445,8 @@ int app_main() {
 
   enable_uart();
 
-  irlap_discovery_request(&irda.lap.discovery, 6, (uint8_t*)info, sizeof(info));
-
   while(1) {
+      char* ping_str = "IrDA test cmd";
 //    irda_tx_enable(NULL);
 //    int timerid = irhal_set_timer(&irda.hal, &timeout, timer_cb, NULL);
 //    ESP_LOGI("IRDA TIMER", "Timer id: %d", timerid);
@@ -450,6 +454,9 @@ int app_main() {
 //    ESP_LOGI(TAG, "Starting carrier detection");
 //    ESP_ERROR_CHECK(irphy_run_cd(&irda.phy, &cd_duration, irda_carrier_cb, NULL));
 //    irda_tx_disable(NULL);
+//    irlap_test_request(&irda.lap, 0, 0xFFFFFFFF, (uint8_t*)ping_str, strlen(ping_str));
+    irlap_discovery_request(&irda.lap.discovery, 6, (uint8_t*)info, sizeof(info));
+//    irlap_unitdata_request(&irda.lap.unitdata, (uint8_t*)info, sizeof(info));
     vTaskDelay(1000 / portTICK_PERIOD_MS);
   }
 }
