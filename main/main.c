@@ -422,7 +422,9 @@ int app_main() {
     .rx_disable = irda_rx_disable,
   };
 
-  ESP_ERROR_CHECK(irphy_init(&irda.phy, &irda.hal, &phy_hal_ops));
+  ESP_ERROR_CHECK(irphy_init(&irda.phy, &irda.hal, &phy_hal_ops, IRPHY_CAPABILITY_BAUDRATE_2400 | \
+    IRPHY_CAPABILITY_BAUDRATE_9600 | IRPHY_CAPABILITY_BAUDRATE_19200 | IRPHY_CAPABILITY_BAUDRATE_38400 | \
+    IRPHY_CAPABILITY_BAUDRATE_57600 | IRPHY_CAPABILITY_BAUDRATE_115200, 1000));
 
   struct irlap_ops lap_ops = {
   };
