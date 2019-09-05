@@ -430,12 +430,9 @@ int app_main() {
     IRPHY_CAPABILITY_BAUDRATE_9600 | IRPHY_CAPABILITY_BAUDRATE_19200 | IRPHY_CAPABILITY_BAUDRATE_38400 | \
     IRPHY_CAPABILITY_BAUDRATE_57600 | IRPHY_CAPABILITY_BAUDRATE_115200, 1000));
 
-  struct irlap_ops lap_ops = {
-  };
-
-  ESP_ERROR_CHECK(irlap_init(&irda.lap, &irda.phy, &lap_ops, NULL));
-  irda.lap.discovery.discovery_ops.confirm = irda_discovery_confirm;
-  irda.lap.discovery.new_address_ops.confirm = irda_new_address_confirm;
+  ESP_ERROR_CHECK(irlap_init(&irda.lap, &irda.phy, NULL));
+  irda.lap.services.discovery.confirm = irda_discovery_confirm;
+  irda.lap.services.new_address.confirm = irda_new_address_confirm;
   irda.lap.services.test.confirm = irda_test_resp_handler;
 
   if(xTaskCreate(event_task_wrapper, "event_task_wrapper", 4096, NULL, 12, NULL) != pdPASS) {
